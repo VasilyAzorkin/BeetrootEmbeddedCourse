@@ -29,3 +29,30 @@ LedState Led::changeState(){
     }
     return _ledState;
 }
+
+Stopwatch::Stopwatch(){
+    _prev = 0;
+    _total = 0;
+    _count = 0;
+}
+
+void Stopwatch::count(){
+    if (_count == 0){
+        _count++;
+        _prev = micros();
+        return;
+    }
+    _total += micros() - _prev;
+    _count++;
+    _prev = micros();
+}
+
+float Stopwatch::getAverage(){
+    if (_count == 0)
+        return 0;
+    return (float)_total / _count;
+}
+
+uint32_t Stopwatch::getCount(){
+    return _count;
+}

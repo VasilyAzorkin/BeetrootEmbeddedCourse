@@ -23,3 +23,15 @@ class Led{
         uint64_t _nextMillis;
         uint16_t _delay;
 };
+
+class Stopwatch{
+    public:
+        Stopwatch();
+        void count();
+        float getAverage();
+        uint32_t getCount();
+    private:
+        uint64_t _prev;
+        uint64_t _total;
+        uint32_t _count;
+};
