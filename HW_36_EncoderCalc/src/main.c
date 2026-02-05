@@ -35,6 +35,21 @@ static void IRAM_ATTR button_pressed_handler(void *arg){
     portEXIT_CRITICAL_ISR(&mux);
 }
 
+static void ClearPrevious(int32_t val){
+    if (val == 0){
+        printf("\b");
+        return;
+    }
+    if(val < 0){
+        printf("\b \b");
+        val = -1 * val;
+    }
+    while(val > 0){
+        printf("\b \b");
+        val = val / 10;
+    }
+}
+
 void app_main(void)
 {
     // GPIO pullups
@@ -90,24 +105,30 @@ void app_main(void)
     pcnt_unit_clear_count(unit);
     pcnt_unit_start(unit);
 
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     printf("Start turning encoder\n");
+    printf("First operand:%ld",encoder_value);
 
     while (1) {
         int count = 0;
         pcnt_unit_get_count(unit, &count);
         
         if (count != 0) {
+            int32_t prev = encoder_value;
             encoder_value += count;            // accumulate deltas
             if (state != CalcState_GotFirst){
+                ClearPrevious(prev);
                 if (state == CalcState_Ready)
-                    printf("First operand: %ld\n", encoder_value);
+                    printf("%ld", encoder_value);
                 else
-                    printf("Second operand: %ld\n", encoder_value);
+                    printf("%ld", encoder_value);
             }
             else{
                 uint8_t index =  ((encoder_value % 4) + 4) % 4;
                 operation = operations[index];
-                printf("Current operation: %c\n", operation);
+                printf("\b \b");
+                printf("%c", operation);
             }
             pcnt_unit_clear_count(unit);
         }
@@ -116,7 +137,7 @@ void app_main(void)
             btn_pressed = false;
             UpdateState();
             if (state == CalcState_GotResult){
-                printf("Result: %ld %c %ld = %ld\n", first, operation, second, result);
+                printf("\nResult: %ld %c %ld = %ld\n", first, operation, second, result);
                 UpdateState();
             }
         }
@@ -126,6 +147,7 @@ void app_main(void)
 }
 
 void reinit(){
+    encoder_value = 0;
     first = 0, second = 0, result = 0, operation = ' ';
 };
 
@@ -138,9 +160,11 @@ void UpdateState(){
         first = encoder_value;
         state = CalcState_GotFirst;
         encoder_value = 0;
+        printf("\nCurrent operation: ");
         break;    
     case CalcState_GotFirst:
         state = CalcState_GotOperation;
+        printf("\nSecond operand:%ld", encoder_value);
         break;
     case CalcState_GotOperation:
         second = encoder_value;
@@ -152,6 +176,7 @@ void UpdateState(){
         break;
     case CalcState_GotResult:
         reinit();
+        printf("First operand:%ld", encoder_value);
         state = CalcState_Ready;
     default:
         break;
