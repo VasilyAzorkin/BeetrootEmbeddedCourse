@@ -27,3 +27,4 @@ void init_gpio_input_isr(uint8_t pin, void* isr){
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     gpio_isr_handler_add(pin, isr, NULL);
 }
+
