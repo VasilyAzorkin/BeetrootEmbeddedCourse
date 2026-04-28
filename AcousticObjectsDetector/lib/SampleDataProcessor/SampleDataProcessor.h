@@ -1,12 +1,13 @@
 #pragma once
 
 #include <stdint.h>
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 2048
 
 typedef struct{
+    const char *name;
     int32_t buffer[BUFFER_SIZE];
     uint16_t head;
-} ring_buffer_t;
+    float filter_state;
+} mic_data_t;
 
-ring_buffer_t init_ring_buffer();
-void add_sample(ring_buffer_t *rb, int32_t sample);
+void add_sample(mic_data_t *mic, int32_t sample);
