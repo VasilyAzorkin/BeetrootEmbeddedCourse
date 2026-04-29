@@ -1,5 +1,8 @@
 #include <MathOperations.h>
 #include <math.h>
+#include "dsps_fft2r.h"
+#include "dsps_wind.h"
+#include "dsps_view.h"
 
 float ema_filter_apply(int32_t sample, float* filter_state, float alpha) {
     *filter_state = alpha * (*filter_state) + (1 - alpha) * (float)sample;
@@ -49,4 +52,59 @@ float calculate_angle_from_lags(int16_t lag31, int16_t lag32, float mic_distance
     float angle_deg = angle_rad * (180.0f / M_PI);
 
     return angle_deg;
+}
+
+float calculate_energy(float* data, uint16_t head, uint16_t data_size, uint8_t window_size) {
+    float current_energy = 0.0f;
+    for(int i = 0; i < window_size; i++) {
+        int idx = (head - i + data_size) % data_size;
+        current_energy += fabsf(data[idx]);
+    }
+    current_energy /= window_size;
+    return current_energy;
+};
+
+float get_max_amplitude(float a, float b, float c) {
+    float amp0 = fabsf(a);
+    float amp1 = fabsf(b);
+    float amp2 = fabsf(c);
+
+    float max_amp = amp0;
+    if (amp1 > max_amp) max_amp = amp1;
+    if (amp2 > max_amp) max_amp = amp2;
+
+    return max_amp;
+}
+
+bool is_valid_spectrum_bandwith(float* data, float* fft_input, float* hann_window, uint16_t data_size,
+     float frequency, float min_threshold, float max_threshold, float* peak_freq) {
+
+    for (uint16_t i = 0; i < data_size; i++) {
+        fft_input[i * 2] = data[i] * hann_window[i];
+        fft_input[i * 2 + 1] = 0.0f;
+    }
+
+    dsps_fft2r_fc32(fft_input, data_size);
+    dsps_bit_rev_fc32(fft_input, data_size);
+
+    float max_power = 0.0f;
+    int peak_bin = 0;
+    
+    for (uint16_t i = 0; i < data_size / 2; i++) {
+        float real = fft_input[i * 2];
+        float imag = fft_input[i * 2 + 1];
+        float power = real * real + imag * imag;
+        if (power > max_power) {
+            max_power = power;
+            peak_bin = i;
+        }
+    }
+
+    *peak_freq = (float)peak_bin * frequency / (float)data_size;
+    
+    if (*peak_freq < min_threshold || *peak_freq > max_threshold) {
+        return false;
+    }
+
+    return true;
 }

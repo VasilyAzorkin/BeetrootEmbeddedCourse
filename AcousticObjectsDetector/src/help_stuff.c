@@ -38,3 +38,13 @@ esp_err_t retry_i2s_channel_init_and_enable(i2s_chan_handle_t handle, i2s_std_co
              name, retry_count);
     return ESP_FAIL;
 }
+
+char* create_log_message_for_angle(uint32_t timestamp, uint8_t lag31, uint8_t lag32, float angle, float amplitude){
+    char *log_str = malloc(128);
+
+    if (log_str) {
+        snprintf(log_str, 128, "[%lu ms] Lags: %d, %d | Angle: %.2f | Amp: %.0f",
+                 timestamp, lag31, lag32, angle, amplitude);
+    }
+    return log_str;
+}

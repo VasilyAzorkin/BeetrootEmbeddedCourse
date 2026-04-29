@@ -7,33 +7,38 @@
 #include "esp_log.h"
 #include "driver/i2s_std.h"
 #include "esp_wifi.h"
-
+#include "dsps_fft2r.h"
+#include "dsps_wind.h"
 
 #define     DEBUG
 #define     INIT_RETRY_COUNT        3
-#define     ALPHA                   0.995f
+#define     ALPHA                   0.98f
 
 #define     I2S_SCK_GPIO            6
 #define     I2S_WS_GPIO             5
 #define     I2S_MIC1_MIC2_SD_GPIO   4
-// #define     I2S_MIC2_SD_GPIO        7
-#define     I2S_MIC3_SD_GPIO        7//15
+#define     I2S_MIC3_SD_GPIO        18
 #define     MIC_FREQUENCY           44100
 #define     DMA_DESC_NUM            16
 #define     DMA_FRAME_NUM           256
-#define     WINDOW_SIZE             (DMA_FRAME_NUM * 2)
 
 #define     DELAY_AFTER_INIT_MS     20000
 #define     MIC_DISTANCE            0.15f
+#define     MIN_TRIGGER_INTERVAL_MS 500
+#define     SOUND_EVENT_QUEUE_SIZE  5
+#define     FFT_SIZE                SAMPLE_WINDOW_SIZE
 
 static i2s_chan_handle_t rx_handle_0;
 static i2s_chan_handle_t rx_handle_1;
-static float filter_state_0 = 0.0f;
-static float filter_state_1 = 0.0f;
-static float filter_state_2 = 0.0f;
 
-static float buff_to_process[3][WINDOW_SIZE] = {0};
+static float fft_input[FFT_SIZE * 2] __attribute__((aligned(16)));
+static float hann_window[FFT_SIZE] __attribute__((aligned(16)));
+bool dsp_initialized = false;
 
+static float background_energy = 0;
+
+QueueHandle_t sound_event_queue;
+QueueHandle_t log_queue;
 
 static mic_data_t mic_data[3] = {
     {
@@ -56,7 +61,32 @@ static mic_data_t mic_data[3] = {
     }
 };
 
-void log_out();
+esp_err_t init_dsp_hardware() {
+    esp_err_t ret = dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+    if (ret != ESP_OK) return ret;
+
+    dsps_wind_hann_f32(hann_window, FFT_SIZE);
+    
+    dsp_initialized = true;
+    return ESP_OK;
+}
+
+static bool triggerd_by_noise(){
+    int idx[3];
+    for(int i = 0; i < 3; i++) {
+        idx[i] = (mic_data[i].head - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+    }
+    
+    float current_energy = calculate_energy(mic_data[2].buffer, idx[2], BUFFER_SIZE, 128);
+
+    float max_amp = get_max_amplitude(mic_data[0].buffer[idx[0]], mic_data[1].buffer[idx[1]], mic_data[2].buffer[idx[2]]);
+
+    bool triggered = (current_energy > background_energy * 5.0f + 50000) && (max_amp > 100000);
+    float alpha = triggered ? 0.001f : 0.05f;
+    background_energy = background_energy * (1.0f - alpha) + current_energy * alpha;
+    
+    return triggered;
+}
 
 void init_mic_devices(){
     i2s_chan_config_t chan_cfg_0 = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -139,19 +169,14 @@ void i2s_read_task(void *arg) {
     static int32_t sample_buffer_0[DMA_FRAME_NUM * 2]; // Buffer to hold raw audio samples
     static int32_t sample_buffer_1[DMA_FRAME_NUM * 2]; // Buffer to hold raw audio samples
     static bool ready_to_process = false;
+    static uint32_t last_trigger_time = 0;
 
     int k = 0;
     while (1) {
-        //ESP_LOGI("I2S", "Reading audio data from I2S channels...");
-        // Read audio data from the I2S channel
         esp_err_t err_0 = i2s_channel_read(rx_handle_0, sample_buffer_0, sizeof(sample_buffer_0), &bytes_read_0, 1000);
         esp_err_t err_1 = i2s_channel_read(rx_handle_1, sample_buffer_1, sizeof(sample_buffer_1), &bytes_read_1, 1000);
 
-        //ESP_LOGI("I2S", "Read %d bytes from channel 0, %d bytes from channel 1", bytes_read_0, bytes_read_1);
-
         if (err_0 == ESP_OK && err_1 == ESP_OK) {
-            // Process the audio samples in sample_buffer
-            // For example, you can convert them to mic_data format and store in mic_data buffers
             uint16_t sample_count = bytes_read_0 / sizeof(int32_t);
 
             for(int i = 0; i < sample_count; i += 2) {
@@ -163,78 +188,114 @@ void i2s_read_task(void *arg) {
                 int32_t aligned_left = raw_left >> 8;
                 int32_t aligned_right = raw_right >> 8;
                 int32_t aligned_rear = raw_rear >> 8;
-                // samples_current[1] = (sample_buffer_0[i * 2 + 1]) >> 8; 
-                //samples_current[2] = sample_buffer_1[i * 2] >> 8;
-
-                // filter_state_0 = ALPHA * filter_state_0 + (1 - ALPHA) * (float)aligned_left;
-                // filter_state_1 = ALPHA * filter_state_1 + (1 - ALPHA) * (float)aligned_right;
-                // filter_state_2 = ALPHA * filter_state_2 + (1 - ALPHA) * (float)aligned_rear;
-
-                // add_sample(&mic_data[0], aligned_left - filter_state_0); // Store the filter state instead of raw sample
-                // add_sample(&mic_data[1], aligned_right - filter_state_1);
-                // add_sample(&mic_data[2], aligned_rear - filter_state_2);
-
+                
 
                 add_sample(&mic_data[0], ema_filter_apply(aligned_left, &(mic_data[0].filter_state), ALPHA));
                 add_sample(&mic_data[1], ema_filter_apply(aligned_right, &(mic_data[1].filter_state), ALPHA));
                 add_sample(&mic_data[2], ema_filter_apply(aligned_rear, &(mic_data[2].filter_state), ALPHA));
-
-                // for (int j = 0; j < 2; j++) {
-                //     // printf("Sample %d: %ld\n", j, samples_current[j]);                    
-                //     add_sample(&mic_data[j], ema_filter_apply(samples_current[j], &(mic_data[j].filter_state), ALPHA));
-                //     //mic_data[j].head = (mic_data[j].head + 1) % BUFFER_SIZE;
-                // }
             }
         } else if (err_0 != ESP_OK) {
             ESP_LOGE("I2S", "Failed to read from I2S channel 0: %s", esp_err_to_name(err_0));
         } else {
             ESP_LOGE("I2S", "Failed to read from I2S channel 1: %s", esp_err_to_name(err_1));
         }
-
-        if(ready_to_process && mic_data[2].buffer[mic_data[2].head] > 10000.0f){ // check if rear mic has data, adjust index if needed
-            int16_t lag31, lag32;
-            get_latest_samples(buff_to_process[0], &mic_data[0], WINDOW_SIZE);
-            get_latest_samples(buff_to_process[1], &mic_data[1], WINDOW_SIZE);
-            get_latest_samples(buff_to_process[2], &mic_data[2], WINDOW_SIZE);
-            calculate_lags(&lag31, &lag32, buff_to_process[0], buff_to_process[1], buff_to_process[2], WINDOW_SIZE, 20);
-            float angle = calculate_angle_from_lags(lag31, lag32, MIC_DISTANCE, MIC_FREQUENCY);
-            printf("Lag 31: %d, Lag 32: %d, Angle: %.2f, mic0: %.2f, mic1: %.2f, mic2: %.2f\n", lag31, lag32, angle, mic_data[0].buffer[mic_data[0].head], mic_data[1].buffer[mic_data[1].head], mic_data[2].buffer[mic_data[2].head]);
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if(ready_to_process && current_time - last_trigger_time > MIN_TRIGGER_INTERVAL_MS && triggerd_by_noise()){ // check if rear mic has data, adjust index if needed
+            last_trigger_time = current_time;
+            sound_event_t event;
+            event.timestamp = current_time;
+            for (int i = 0; i < 3; i++) {
+                get_latest_samples(event.buff_to_process[i], &mic_data[i], SAMPLE_WINDOW_SIZE);
+            }
+            if (xQueueSend(sound_event_queue, &event, 0) != pdPASS) {
+                // ESP_LOGW("I2S", "Sound event queue is full, dropping event");
+            }
         }
         else{
             ready_to_process = true;
         }
 
-        if (k == 7) log_out();
-        k++;
         vTaskDelay(pdMS_TO_TICKS(1)); // to avoid task watchdog timeout, adjust delay as needed based on processing time
+    }
+}
+
+void calculation_task(void *arg) {
+    sound_event_t event;
+    while (1) {
+        if (xQueueReceive(sound_event_queue, &event, portMAX_DELAY) == pdPASS) {
+
+            if(!dsp_initialized) {
+                continue;
+            }
+
+            int i = 0;
+            float peak_freq;
+            bool all_mics_valid = false;
+
+
+            for (; i < 3; i++) {
+                if (is_valid_spectrum_bandwith(event.buff_to_process[i], fft_input, hann_window, FFT_SIZE, MIC_FREQUENCY, 2000.0f, 10000.0f, &peak_freq)) {
+                    // ESP_LOGW("Processing", "Invalid spectrum bandwidth for mic %d, skipping event", i);
+                    all_mics_valid = true;
+                    break;
+                }
+            }
+            
+            if (!all_mics_valid) continue; // if all mics have valid spectrum, proceed with processing
+            
+            printf("Peak frequency: %.2f Hz on mic %d\n", peak_freq, i);
+
+
+            int16_t lag31, lag32;
+            calculate_lags(&lag31, &lag32, event.buff_to_process[0], event.buff_to_process[1], event.buff_to_process[2], SAMPLE_WINDOW_SIZE, 32);
+            if (abs(lag31) >= 31 || abs(lag32) >= 31) {
+                //ESP_LOGW("Processing", "Calculated lags are out of expected range: lag31=%d, lag32=%d", lag31, lag32);
+            }
+            else {
+                float angle = calculate_angle_from_lags(lag31, lag32, MIC_DISTANCE, MIC_FREQUENCY);
+                if (lag31 != 0 && lag32 != 0) {
+                    int real_idx = (mic_data[2].head - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+                    char *log_message = create_log_message_for_angle(event.timestamp, lag31, lag32, angle, mic_data[2].buffer[real_idx]);
+                    if (log_message) {
+                        if (xQueueSend(log_queue, &log_message, 0) != pdPASS) {
+                            free(log_message); // Free the log message if it cannot be queued
+                        }
+                    }
+
+                    printf("[%lu ms] Lags: %d, %d | Angle: %.2f | Amp: %.0f\n", 
+                        event.timestamp, 
+                        lag31, lag32, 
+                        angle, 
+                        mic_data[2].buffer[real_idx]);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void logger_task(void *arg) {
+    char *log_message;
+    while (1) {
+        // Implement logging mechanism here, e.g., read from a log queue and write to storage or send over network
+        if (xQueueReceive(log_queue, &log_message, 0) == pdPASS) {
+            printf("LOG: %s\n", log_message);
+        }
+        if (log_message) free(log_message); // Free the allocated log message after processing
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Adjust delay as needed
     }
 }
 
 void app_main() {
     esp_wifi_stop();
     init_mic_devices();
+    init_dsp_hardware();
 
     vTaskDelay(pdMS_TO_TICKS(DELAY_AFTER_INIT_MS));
+    sound_event_queue = xQueueCreate(SOUND_EVENT_QUEUE_SIZE, sizeof(sound_event_t));
+    log_queue = xQueueCreate(10, sizeof(char[256])); 
 
     xTaskCreatePinnedToCore(i2s_read_task, "i2s_read_task", 8192, NULL, 10, NULL, 1);
-
-    // for (int i = 0; i < 3; i++) {
-    //     mic_data[i] = init_ring_buffer();
-    // }
-}
-
-void log_out() {
-    printf("DATA: Latest samples:\n");
-    printf("%d\t%d", mic_data[0].head, mic_data[1].head);
-    int i = 0;
-    // while (i < mic_data[0].head && i < mic_data[1].head && i < mic_data[2].head) {
-    //     printf("%ld\t%ld\t%ld\t%f\t%f\t%f\n", mic_data[0].buffer[i], mic_data[1].buffer[i], mic_data[2].buffer[i], mic_data[0].filter_state, mic_data[1].filter_state, mic_data[2].filter_state);
-    //     i++;
-    // }
-    while (i < BUFFER_SIZE) {
-        printf("%f\t%f\t%f\t%f\n", mic_data[0].buffer[i], mic_data[1].buffer[i], mic_data[2].buffer[i], mic_data[2].filter_state);
-        i++;
-    }
-    //mic_data[0].head = 0; mic_data[1].head = 0;
-    printf("\n");
+    xTaskCreatePinnedToCore(calculation_task, "calculation_task", 8192, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(logger_task, "logger_task", 8192, NULL, 1, NULL, 0);
 }
